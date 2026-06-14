@@ -1,0 +1,94 @@
+name: Build iPadOS IPA
+
+on:
+  push:
+    branches: [ "stable", "main" ]
+  pull_request:
+    branches: [ "stable", "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-14
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    # Bước 1: Tự động chạy file Python sửa giao diện chia đôi màn hình iPad
+    - name: Run Auto-Layout Patch for iPadOS
+      run: |
+        if [ -f patch_ios.py ]; then
+          python3 patch_ios.py
+        else
+          echo "Không tìm thấy patch_ios.py, bỏ qua bước sửa giao diện."
+        fi
+
+    # Bước 2: Tự động chèn mã sửa lỗi 'sys_icache_invalidate' của thư viện Asmjit trên iOS
+    - name: Auto Fix Asmjit Compiler Error for iOS
+      run: |
+        python3 -c "
+        import os
+        target_file = 'third_party/asmjit/asmjit/core/virtmem.cpp'
+        fix_code = '#include <libkern/OSCacheControl.h>\nextern \"C\" void sys_icache_invalidate(void *start, size_t len);\n'
+        
+        def apply_patch(fp):
+            with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            if 'OSCacheControl.h' not in content:
+                content = fix_code + content
+                with open(fp, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                print(f'==> Đã vá lỗi thành công cho file: {fp}')
+
+        if os.path.exists(target_file):
+            apply_patch(target_file)
+        else:
+            print('Không tìm thấy ở đường dẫn gốc, đang lùng sục toàn bộ thư mục...')
+            for root, dirs, files in os.walk('.'):
+                if 'virtmem.cpp' in files:
+                    apply_patch(os.path.join(root, 'virtmem.cpp'))
+        "
+
+    - name: Setup CMake
+      uses: jwlawson/actions-setup-cmake@v2
+      with:
+        cmake-version: '3.28.x'
+
+    - name: Configure CMake for iPadOS
+      run: |
+        mkdir build_ios
+        cd build_ios
+        cmake .. \
+          -DCMAKE_SYSTEM_NAME=iOS \
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+          -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
+          -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_STYLE=Manual \
+          -G Xcode
+
+    - name: Compile and Build App Bundle (Auto-detect Target)
+      run: |
+        cd build_ios
+        cmake --build . --config Release
+
+    - name: Package into IPA (Unsigned for TrollStore/AltStore)
+      run: |
+        mkdir -p Payload
+        APP_DIR=$(find build_ios -name "*.app" -type d | head -n 1)
+        echo "Tìm thấy App Bundle tại: $APP_DIR"
+        
+        if [ -z "$APP_DIR" ]; then
+          echo "Lỗi: Không tìm thấy file .app!"
+          exit 1
+        fi
+        
+        cp -r "$APP_DIR" Payload/
+        zip -r CasioEmu_iPadOS.ipa Payload
+
+    - name: Upload Artifact (.IPA)
+      uses: actions/upload-artifact@v4
+      with:
+        name: CasioEmu-iPadOS-Installation
+        path: CasioEmu_iPadOS.ipa
